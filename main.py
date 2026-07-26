@@ -54,6 +54,7 @@ _STORES: Dict[str, List[str]] = {
     "facilita":         [sys.executable, "-m", "markets.facilita.scraper_facilita"],
     "qualidoc":         [sys.executable, "-m", "markets.qualidoc.scraper_qualidoc"],
     "mevofarma":        [sys.executable, "-m", "markets.mevofarma.scraper_mevofarma"],
+    "oncoexpresso":     [sys.executable, "-m", "markets.oncoexpresso.scraper_oncoexpresso"],
 }
 
 # Stores whose EAN must be enriched from product pages after scraping

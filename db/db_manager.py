@@ -698,6 +698,11 @@ class MevofarmaDB(StoreDB):
     DB_ENV_KEY = "DATABASE_URL_MEVOFARMA"
 
 
+class OncoexpressoDB(StoreDB):
+    STORE_ID   = "oncoexpresso"
+    DB_ENV_KEY = "DATABASE_URL_ONCOEXPRESSO"
+
+
 # Registry used by the CLI
 STORE_REGISTRY: Dict[str, type] = {
     "drogaleste":       DrogalesteDB,
@@ -721,6 +726,7 @@ STORE_REGISTRY: Dict[str, type] = {
     "facilita":         FacilitaDB,
     "qualidoc":         QualidocDB,
     "mevofarma":        MevofarmaDB,
+    "oncoexpresso":     OncoexpressoDB,
 }
 
 

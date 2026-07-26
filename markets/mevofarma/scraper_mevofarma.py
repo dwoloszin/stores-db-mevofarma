@@ -40,7 +40,8 @@ STORE_ID   = "mevofarma"
 PAGE_SIZE  = 50     # items per VTEX page (_to - _from + 1)
 PRICE_SENTINEL = 9_999_000  # VTEX "price not available" placeholder (real price is in Price)
 VTEX_CAP   = 2550   # hard VTEX limit: _to cannot exceed 2549
-DELAY      = 0.20   # seconds between requests
+DELAY      = 0.40   # seconds between requests (this VTEX instance rate-limits aggressively)
+MAX_TRIES  = 8      # retries on 429 / 5xx before giving up on a request
 
 GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 
@@ -60,30 +61,64 @@ def _make_session() -> requests.Session:
     return s
 
 
+def _catalog_get(
+    session: requests.Session,
+    params: Dict[str, Any],
+) -> Tuple[Optional[int], Optional[List[Dict]], str]:
+    """
+    GET the catalog search endpoint with hard back-off on 429/5xx.
+
+    Returns (subtree_total, products, state) where state is one of:
+      "ok"    — a valid JSON response (products may be an empty list)
+      "error" — persistent 429/5xx/network failure after MAX_TRIES
+    subtree_total comes from the VTEX `resources` header (products/total).
+    """
+    url = f"{API_BASE}/api/catalog_system/pub/products/search/"
+    for attempt in range(MAX_TRIES):
+        try:
+            r = session.get(url, params=params, timeout=30)
+        except requests.RequestException:
+            time.sleep(min(3 * (attempt + 1), 30))
+            continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(min(5 * (attempt + 1), 45))
+            continue
+        if r.status_code not in (200, 206):
+            return None, None, "error"
+        try:
+            products = r.json()
+        except ValueError:
+            return None, None, "error"
+        total = 0
+        resources = r.headers.get("resources", "")
+        if "/" in resources:
+            try:
+                total = int(resources.split("/")[-1])
+            except ValueError:
+                pass
+        return total, products, "ok"
+    return None, None, "error"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Category planning (adaptive, full hierarchical fq paths)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _category_total(session: requests.Session, fq: str, attempt: int = 0) -> Tuple[int, int]:
-    """Return (http_status, subtree_total) for a category fq path."""
-    r = session.get(
-        f"{API_BASE}/api/catalog_system/pub/products/search/",
-        params={"fq": fq, "_from": 0, "_to": 1},
-        timeout=25,
-    )
-    if r.status_code == 429:
-        if attempt >= 5:
-            return 429, 0
-        time.sleep(15)
-        return _category_total(session, fq, attempt + 1)
-    total = 0
-    resources = r.headers.get("resources", "")
-    if "/" in resources:
+def _fetch_category_tree(session: requests.Session) -> List[Dict]:
+    """GET the category tree with retry on 429/5xx."""
+    url = f"{API_BASE}/api/catalog_system/pub/category/tree/50"
+    for attempt in range(MAX_TRIES):
         try:
-            total = int(resources.split("/")[-1])
-        except ValueError:
-            pass
-    return r.status_code, total
+            r = session.get(url, timeout=30)
+        except requests.RequestException:
+            time.sleep(min(3 * (attempt + 1), 30))
+            continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            time.sleep(min(5 * (attempt + 1), 45))
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError("category tree: rate limited/5xx after retries")
 
 
 def plan_categories(session: requests.Session) -> List[Dict]:
@@ -91,9 +126,7 @@ def plan_categories(session: requests.Session) -> List[Dict]:
     Walk the VTEX category tree and return a minimal set of fq targets that
     cover the whole catalogue, each (where possible) under the 2550 cap.
     """
-    r = session.get(f"{API_BASE}/api/catalog_system/pub/category/tree/50", timeout=25)
-    r.raise_for_status()
-    tree = r.json()
+    tree = _fetch_category_tree(session)
 
     targets: List[Dict] = []
 
@@ -103,14 +136,15 @@ def plan_categories(session: requests.Session) -> List[Dict]:
         fq    = "C:/" + "/".join(ids) + "/"
         children = node.get("children") or []
 
-        status, total = _category_total(session, fq)
+        total, _products, state = _catalog_get(session, {"fq": fq, "_from": 0, "_to": 1})
+        time.sleep(DELAY)
 
-        if status not in (200, 206):
-            # VTEX occasionally 500s a category — descend into children to recover
+        if state != "ok":
+            # couldn't measure this node — descend into children to recover
             for ch in children:
                 visit(ch, ids, names)
             return
-        if total <= 0:
+        if not total or total <= 0:
             return
         if total <= VTEX_CAP or not children:
             targets.append({"fq": fq, "label": "/".join(n for n in names if n), "total": total})
@@ -128,26 +162,11 @@ def plan_categories(session: requests.Session) -> List[Dict]:
 # Page fetcher
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _fetch_page(session: requests.Session, fq: str, from_: int, attempt: int = 0) -> List[Dict]:
+def _fetch_page(session: requests.Session, fq: str, from_: int) -> Tuple[Optional[List[Dict]], str]:
+    """Return (products, state). state 'ok' | 'error' (persistent 429/5xx)."""
     to_ = min(from_ + PAGE_SIZE - 1, VTEX_CAP - 1)
-    r = session.get(
-        f"{API_BASE}/api/catalog_system/pub/products/search/",
-        params={"fq": fq, "_from": from_, "_to": to_},
-        timeout=25,
-    )
-    if r.status_code == 429:
-        if attempt >= 5:
-            print("    Rate limited 5x — giving up on this page")
-            return []
-        print("    Rate limited — sleeping 15s")
-        time.sleep(15)
-        return _fetch_page(session, fq, from_, attempt + 1)
-    if r.status_code not in (200, 206):
-        return []
-    try:
-        return r.json()
-    except ValueError:
-        return []
+    _total, products, state = _catalog_get(session, {"fq": fq, "_from": from_, "_to": to_})
+    return products, state
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -236,20 +255,29 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
     grand_total = sum(c["total"] for c in categories)
     print(f"Category targets: {len(categories)}  (sum of subtree totals: {grand_total:,})")
 
+    incomplete: List[str] = []
     for cat in categories:
         fq        = cat["fq"]
         cat_label = cat["label"]
         cat_total = cat["total"]
         from_     = 0
+        seen_in_cat = 0
         cat_offers: List[Dict] = []
+        failed = False
 
         while from_ < VTEX_CAP:
-            page = _fetch_page(session, fq, from_)
+            page, state = _fetch_page(session, fq, from_)
+            if state != "ok":
+                # persistent 429/5xx — do NOT treat as end-of-category
+                print(f"  ERROR: {cat_label[:50]} failed at from={from_} (429/5xx) — category incomplete")
+                failed = True
+                break
             if not page:
                 break
 
             new_this_page = 0
             for raw in page:
+                seen_in_cat += 1
                 pid = str(raw.get("productId", "")).strip()
                 if not pid or pid in seen_pids:
                     continue
@@ -279,6 +307,10 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
             if limit and total_saved + len(cat_offers) >= limit:
                 break
 
+        # Flag categories that returned far fewer rows than expected
+        if failed or (cat_total and seen_in_cat < min(cat_total, VTEX_CAP) * 0.9):
+            incomplete.append(f"{cat_label} ({seen_in_cat}/{cat_total})")
+
         if cat_offers:
             stats = db.save(cat_offers, verbose=False)
             total_saved    += stats["upserted"]
@@ -295,6 +327,10 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
             break
 
     print(f"\nFinished: {len(seen_pids):,} unique products seen.")
+    if incomplete:
+        print(f"  WARNING: {len(incomplete)} categories returned fewer rows than expected:")
+        for c in incomplete[:20]:
+            print(f"    - {c}")
     return {"upserted": total_upserted, "history_inserted": total_history,
             "skipped_zero": total_skipped, "total_unique": total_saved}
 
