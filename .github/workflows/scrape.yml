@@ -87,6 +87,27 @@ jobs:
 
           python -m main $ARGS
 
+      - name: Price enrichment (real selling price / promos)
+        if: success()
+        run: |
+          STORE="${{ secrets.STORE_KEY }}"
+          # Some stores (Drogasil/Drogaraia) only expose a reference/max price in
+          # the listing; a per-store enricher fetches product pages for the real
+          # selling price. Runs right after the scrape so promos are always fresh.
+          if [ -f "markets/$STORE/enrich_price_$STORE.py" ]; then
+            echo "Running price enrichment for $STORE ..."
+            python -m markets.$STORE.enrich_price_$STORE --workers 30
+          else
+            echo "No price enricher for $STORE — skipping"
+          fi
+
+      - name: Mark stale offers unavailable
+        if: success()
+        # Scrapers only upsert what they find, so products that drop off the site
+        # keep is_available=true forever. After a successful scrape, flip anything
+        # not refreshed in the last 24h to unavailable (it left the catalogue).
+        run: python -m db.db_manager mark-stale "${{ secrets.STORE_KEY }}" --hours 24
+
       - name: Prune old price history
         if: success()
         run: python -m db.db_manager prune "${{ secrets.STORE_KEY }}" --days 180

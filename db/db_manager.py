@@ -296,21 +296,27 @@ class StoreDB:
 
     # ------------------------------------------------------------------
 
-    def save(self, offers: List[Dict], batch_size: int = 200, verbose: bool = True) -> Dict[str, int]:
+    def save(self, offers: List[Dict], batch_size: int = 200, verbose: bool = True,
+             preserve_promo: bool = False) -> Dict[str, int]:
         """
         Upsert offers and append price_history rows for changed prices.
         Returns {"upserted": N, "history_inserted": N, "skipped_zero": N}.
         Set verbose=False for silent per-category saves (scraper chunk mode).
+        Set preserve_promo=True when the scraper does NOT know the promo price
+        (e.g. Drogasil/Drogaraia, where a separate daily enrichment pass owns
+        promo_price/discount_pct) — the upsert then keeps the existing values
+        instead of nulling them out on every listing scrape.
         Automatically reconnects once on SSL/network drop.
         """
         try:
-            return self._save_impl(offers, batch_size, verbose)
+            return self._save_impl(offers, batch_size, verbose, preserve_promo)
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
             print(f"  DB connection lost ({exc.__class__.__name__}: {exc}) — reconnecting and retrying...")
             self._reconnect()
-            return self._save_impl(offers, batch_size, verbose)
+            return self._save_impl(offers, batch_size, verbose, preserve_promo)
 
-    def _save_impl(self, offers: List[Dict], batch_size: int = 200, verbose: bool = True) -> Dict[str, int]:
+    def _save_impl(self, offers: List[Dict], batch_size: int = 200, verbose: bool = True,
+                   preserve_promo: bool = False) -> Dict[str, int]:
         now      = datetime.now(timezone.utc)
         store_id = self.STORE_ID
 
@@ -350,10 +356,25 @@ class StoreDB:
         if verbose:
             print(f"  Offers: {len(rows):,} valid, {skipped_zero:,} skipped (zero/null price)")
 
+        # When preserve_promo is set, the listing scrape must not clobber the
+        # promo_price/discount_pct/is_discounted that the daily enrichment owns.
+        if preserve_promo:
+            promo_set = (
+                "promo_price   = COALESCE(EXCLUDED.promo_price, offers.promo_price),\n"
+                "                discount_pct  = COALESCE(EXCLUDED.discount_pct, offers.discount_pct),\n"
+                "                is_discounted = (COALESCE(EXCLUDED.promo_price, offers.promo_price) IS NOT NULL),"
+            )
+        else:
+            promo_set = (
+                "promo_price   = EXCLUDED.promo_price,\n"
+                "                discount_pct  = EXCLUDED.discount_pct,\n"
+                "                is_discounted = EXCLUDED.is_discounted,"
+            )
+
         # Pure upsert — no prior SELECT needed.
         # price_history rows are written automatically by the DB trigger
         # (trg_price_history) on INSERT and on price-changing UPDATEs.
-        upsert_sql = """
+        upsert_sql = f"""
             INSERT INTO offers (
                 product_id, store_id, product_name, brand, category_path, ean,
                 regular_price, promo_price, discount_pct, unit,
@@ -367,13 +388,11 @@ class StoreDB:
                 category_path = EXCLUDED.category_path,
                 ean           = COALESCE(NULLIF(EXCLUDED.ean, ''), offers.ean),
                 regular_price = EXCLUDED.regular_price,
-                promo_price   = EXCLUDED.promo_price,
-                discount_pct  = EXCLUDED.discount_pct,
+                {promo_set}
                 unit          = EXCLUDED.unit,
                 is_available  = EXCLUDED.is_available,
                 stock         = EXCLUDED.stock,
                 offer_tag     = EXCLUDED.offer_tag,
-                is_discounted = EXCLUDED.is_discounted,
                 is_generic    = EXCLUDED.is_generic,
                 prescription  = EXCLUDED.prescription,
                 product_url   = EXCLUDED.product_url,
@@ -442,6 +461,66 @@ class StoreDB:
             print(f"  DB connection lost ({exc.__class__.__name__}: {exc}) — reconnecting and retrying...")
             self._reconnect()
             return self._load_missing_eans_impl()
+
+    def load_all_urls(self, min_price: float = 0.0) -> Dict[str, str]:
+        """
+        Returns {product_id: product_url} for offers with a product URL and
+        regular_price >= min_price. Used by the price-enrichment pass
+        (Drogasil/Drogaraia), where the fast listing only exposes the
+        reference/max price (PMC) and the real selling price is on each product
+        page. min_price limits enrichment to high-value products to keep the
+        pass fast (e.g. 1000 → ~2% of the catalogue).
+        """
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "SELECT product_id, product_url FROM offers "
+                    "WHERE product_url IS NOT NULL AND product_url != '' "
+                    "  AND regular_price >= %s",
+                    (min_price,),
+                )
+                return {row[0]: row[1] for row in cur.fetchall()}
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            self._reconnect()
+            return self.load_all_urls(min_price)
+
+    def update_promo_prices(self, price_map: Dict[str, tuple]) -> int:
+        """
+        Bulk-update regular_price / promo_price / discount_pct for the given
+        {product_id: (regular_price, promo_price, discount_pct)} map.
+        price_history rows are written automatically by the DB trigger when a
+        price actually changes. Returns rows updated.
+        """
+        rows = [
+            (reg, promo, disc, pid)
+            for pid, (reg, promo, disc) in price_map.items()
+            if reg is not None
+        ]
+        if not rows:
+            return 0
+        total = 0
+        try:
+            with self._conn.cursor() as cur:
+                for i in range(0, len(rows), 500):
+                    psycopg2.extras.execute_values(
+                        cur,
+                        "UPDATE offers SET "
+                        "  regular_price = v.reg::numeric, "
+                        "  promo_price   = v.promo::numeric, "
+                        "  discount_pct  = v.disc::numeric, "
+                        "  is_discounted = (v.promo IS NOT NULL), "
+                        "  updated_at    = NOW() "
+                        "FROM (VALUES %s) AS v(reg, promo, disc, product_id) "
+                        "WHERE offers.product_id = v.product_id::text",
+                        rows[i:i + 500],
+                        page_size=500,
+                    )
+                    total += cur.rowcount if cur.rowcount >= 0 else 0
+            self._conn.commit()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            self._reconnect()
+            return self.update_promo_prices(price_map)
+        return total
 
     def _load_missing_eans_impl(self) -> Dict[str, str]:
         with self._conn.cursor() as cur:
@@ -585,6 +664,34 @@ class StoreDB:
         print(f"  Pruned {deleted:,} price_history rows older than {days} days.")
         return deleted
 
+    def mark_stale_unavailable(self, hours: int = 24) -> int:
+        """
+        Mark as unavailable any offer still flagged available but whose row was
+        NOT refreshed by a scrape in the last `hours`. Scrapers upsert
+        updated_at=NOW() for every product they return, so a stale updated_at
+        means the product dropped out of the catalogue (very likely no longer
+        sold). The 24h default spans several scrape cycles, so a single failed
+        or partial run never wrongly flips products — they only go unavailable
+        after genuinely disappearing for a day. A product that reappears is
+        upserted back to is_available=true automatically.
+        Returns the number of rows flipped.
+        """
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE offers SET is_available = false "
+                    "WHERE is_available IS TRUE "
+                    "  AND updated_at < NOW() - make_interval(hours => %s)",
+                    (hours,),
+                )
+                flipped = cur.rowcount
+            self._conn.commit()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            self._reconnect()
+            return self.mark_stale_unavailable(hours)
+        print(f"  Marked {flipped:,} stale offers unavailable (not seen in {hours}h).")
+        return flipped
+
     def close(self) -> None:
         self._conn.close()
 
@@ -703,6 +810,66 @@ class OncoexpressoDB(StoreDB):
     DB_ENV_KEY = "DATABASE_URL_ONCOEXPRESSO"
 
 
+class OncoHealthMedicamentosDB(StoreDB):
+    STORE_ID   = "oncohealthmedicamentos"
+    DB_ENV_KEY = "DATABASE_URL_ONCOHEALTHMEDICAMENTOS"
+
+
+class RemedDB(StoreDB):
+    STORE_ID   = "remed"
+    DB_ENV_KEY = "DATABASE_URL_REMED"
+
+
+class LjOncoexpressDB(StoreDB):
+    STORE_ID   = "lj_oncoexpress"
+    DB_ENV_KEY = "DATABASE_URL_LJ_ONCOEXPRESS"
+
+
+class CampeaDB(StoreDB):
+    STORE_ID   = "campea"
+    DB_ENV_KEY = "DATABASE_URL_CAMPEA"
+
+
+class PachecoDB(StoreDB):
+    STORE_ID   = "pacheco"
+    DB_ENV_KEY = "DATABASE_URL_PACHECO"
+
+
+class MundialDB(StoreDB):
+    STORE_ID   = "mundial"
+    DB_ENV_KEY = "DATABASE_URL_MUNDIAL"
+
+
+class FastDB(StoreDB):
+    STORE_ID   = "fast"
+    DB_ENV_KEY = "DATABASE_URL_FAST"
+
+
+class ProgoodsDB(StoreDB):
+    STORE_ID   = "progoods"
+    DB_ENV_KEY = "DATABASE_URL_PROGOODS"
+
+
+class HeraDB(StoreDB):
+    STORE_ID   = "hera"
+    DB_ENV_KEY = "DATABASE_URL_HERA"
+
+
+class AlianzaDB(StoreDB):
+    STORE_ID   = "alianza"
+    DB_ENV_KEY = "DATABASE_URL_ALIANZA"
+
+
+class SingularDB(StoreDB):
+    STORE_ID   = "singular"
+    DB_ENV_KEY = "DATABASE_URL_SINGULAR"
+
+
+class IntegralDB(StoreDB):
+    STORE_ID   = "integral"
+    DB_ENV_KEY = "DATABASE_URL_INTEGRAL"
+
+
 # Registry used by the CLI
 STORE_REGISTRY: Dict[str, type] = {
     "drogaleste":       DrogalesteDB,
@@ -727,6 +894,18 @@ STORE_REGISTRY: Dict[str, type] = {
     "qualidoc":         QualidocDB,
     "mevofarma":        MevofarmaDB,
     "oncoexpresso":     OncoexpressoDB,
+    "oncohealthmedicamentos": OncoHealthMedicamentosDB,
+    "remed":            RemedDB,
+    "lj_oncoexpress":   LjOncoexpressDB,
+    "campea":           CampeaDB,
+    "pacheco":          PachecoDB,
+    "mundial":          MundialDB,
+    "fast":             FastDB,
+    "progoods":         ProgoodsDB,
+    "hera":             HeraDB,
+    "alianza":          AlianzaDB,
+    "singular":         SingularDB,
+    "integral":         IntegralDB,
 }
 
 
@@ -846,6 +1025,15 @@ if __name__ == "__main__":
     p_prune.add_argument("--days", type=int, default=180,
                          help="Delete history older than N days (default: 180)")
 
+    # mark-stale
+    p_stale = sub.add_parser(
+        "mark-stale",
+        help="Mark offers not seen in the last N hours as unavailable",
+    )
+    p_stale.add_argument("store", choices=list(STORE_REGISTRY) + ["all"])
+    p_stale.add_argument("--hours", type=int, default=24,
+                         help="Flip offers not updated in the last N hours (default: 24)")
+
     args = parser.parse_args()
     load_env(args.env)
 
@@ -883,6 +1071,17 @@ if __name__ == "__main__":
             try:
                 db = STORE_REGISTRY[store]()
                 db.prune_history(args.days)
+                db.close()
+            except Exception as exc:
+                print(f"[{store}] ERROR: {exc}")
+
+    elif args.cmd == "mark-stale":
+        stores = list(STORE_REGISTRY) if args.store == "all" else [args.store]
+        for store in stores:
+            print(f"[{store}] marking offers not seen in {args.hours}h as unavailable ...")
+            try:
+                db = STORE_REGISTRY[store]()
+                db.mark_stale_unavailable(args.hours)
                 db.close()
             except Exception as exc:
                 print(f"[{store}] ERROR: {exc}")

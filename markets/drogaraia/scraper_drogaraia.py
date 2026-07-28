@@ -402,7 +402,7 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
 
         # Save this category's batch and free memory
         if cat_offers:
-            stats = db.save(cat_offers, verbose=False)
+            stats = db.save(cat_offers, verbose=False, preserve_promo=True)
             total_saved    += stats["upserted"]
             total_upserted += stats["upserted"]
             total_history  += stats["history_inserted"]

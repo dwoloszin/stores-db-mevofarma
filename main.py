@@ -55,6 +55,18 @@ _STORES: Dict[str, List[str]] = {
     "qualidoc":         [sys.executable, "-m", "markets.qualidoc.scraper_qualidoc"],
     "mevofarma":        [sys.executable, "-m", "markets.mevofarma.scraper_mevofarma"],
     "oncoexpresso":     [sys.executable, "-m", "markets.oncoexpresso.scraper_oncoexpresso"],
+    "oncohealthmedicamentos": [sys.executable, "-m", "markets.oncohealthmedicamentos.scraper_oncohealthmedicamentos"],
+    "remed":            [sys.executable, "-m", "markets.remed.scraper_remed"],
+    "lj_oncoexpress":   [sys.executable, "-m", "markets.lj_oncoexpress.scraper_lj_oncoexpress"],
+    "campea":           [sys.executable, "-m", "markets.campea.scraper_campea"],
+    "pacheco":          [sys.executable, "-m", "markets.pacheco.scraper_pacheco"],
+    "mundial":          [sys.executable, "-m", "markets.mundial.scraper_mundial"],
+    "fast":             [sys.executable, "-m", "markets.fast.scraper_fast"],
+    "progoods":         [sys.executable, "-m", "markets.progoods.scraper_progoods"],
+    "hera":             [sys.executable, "-m", "markets.hera.scraper_hera"],
+    "alianza":          [sys.executable, "-m", "markets.alianza.scraper_alianza"],
+    "singular":         [sys.executable, "-m", "markets.singular.scraper_singular"],
+    "integral":         [sys.executable, "-m", "markets.integral.scraper_integral"],
 }
 
 # Stores whose EAN must be enriched from product pages after scraping
