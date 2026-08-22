@@ -67,6 +67,35 @@ _STORES: Dict[str, List[str]] = {
     "alianza":          [sys.executable, "-m", "markets.alianza.scraper_alianza"],
     "singular":         [sys.executable, "-m", "markets.singular.scraper_singular"],
     "integral":         [sys.executable, "-m", "markets.integral.scraper_integral"],
+    "nissei":           [sys.executable, "-m", "markets.nissei.scraper_nissei"],
+    "veracruz":         [sys.executable, "-m", "markets.veracruz.scraper_veracruz"],
+    "farmagerty":       [sys.executable, "-m", "markets.farmagerty.scraper_farmagerty"],
+    "farmsaopaulo":     [sys.executable, "-m", "markets.farmsaopaulo.scraper_farmsaopaulo"],
+    "sampharma":        [sys.executable, "-m", "markets.sampharma.scraper_sampharma"],
+    "drogal":           [sys.executable, "-m", "markets.drogal.scraper_drogal"],
+    "redesuperpopular": [sys.executable, "-m", "markets.redesuperpopular.scraper_redesuperpopular"],
+    "saojoao":          [sys.executable, "-m", "markets.saojoao.scraper_saojoao"],
+    "venancio":         [sys.executable, "-m", "markets.venancio.scraper_venancio"],
+    "indiana":          [sys.executable, "-m", "markets.indiana.scraper_indiana"],
+    "globo":            [sys.executable, "-m", "markets.globo.scraper_globo"],
+    "permanente":       [sys.executable, "-m", "markets.permanente.scraper_permanente"],
+    "anossadrogaria":   [sys.executable, "-m", "markets.anossadrogaria.scraper_anossadrogaria"],
+    "moderna":          [sys.executable, "-m", "markets.moderna.scraper_moderna"],
+    "santalucia":       [sys.executable, "-m", "markets.santalucia.scraper_santalucia"],
+    "araujo":           [sys.executable, "-m", "markets.araujo.scraper_araujo"],
+    "catarinense":      [sys.executable, "-m", "markets.catarinense.scraper_catarinense"],
+    "callfarma":        [sys.executable, "-m", "markets.callfarma.scraper_callfarma"],
+}
+
+# Stores that share a rate-limited host must NOT run at the same time, or the
+# shared WAF throttles/blocks the IP (it trips on cumulative load — the biggest
+# store then fails mid-run). Stores mapped to the same group run one at a time;
+# different groups and ungrouped stores still run fully in parallel. The three
+# Convertiez pharmacies all sit behind the same Cloudflare/Convertiez WAF.
+_SERIAL_GROUPS: Dict[str, str] = {
+    "campea":       "convertiez",
+    "veracruz":     "convertiez",
+    "farmsaopaulo": "convertiez",
 }
 
 # Stores whose EAN must be enriched from product pages after scraping
@@ -117,46 +146,57 @@ def _run_store(
     starts: Dict[str, float],
     lock: threading.Lock,
     log_enabled: bool = False,
+    group_lock: Optional[threading.Lock] = None,
 ) -> None:
-    t0 = time.time()
-    with lock:
-        starts[store] = t0
-    if log_enabled:
-        _log(store, f"started  (log -> {log_path.name})")
-    else:
-        _log(store, "started")
-
+    # Serial-group gate: if this store shares a WAF group with another running
+    # store, wait until the group frees. Time spent waiting is NOT counted as run
+    # time — t0 is taken only after the lock is held — so durations/ETA stay honest.
+    if group_lock is not None and not group_lock.acquire(blocking=False):
+        _log(store, "queued (serial group busy - starts when the group frees) ...")
+        group_lock.acquire()
     try:
+        t0 = time.time()
+        with lock:
+            starts[store] = t0
         if log_enabled:
-            with log_path.open("w", encoding="utf-8") as lf:
-                proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True)
+            _log(store, f"started  (log -> {log_path.name})")
         else:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _log(store, "started")
 
-        elapsed = time.time() - t0
-        ok = proc.returncode == 0
-        with lock:
-            results[store] = ok
-            durations[store] = elapsed
-            starts.pop(store, None)
-        status = "done" if ok else f"FAILED (exit {proc.returncode})"
-        _log(store, f"{status}  [{elapsed / 60:.1f} min]")
-
-        if not ok:
+        try:
             if log_enabled:
-                _tail(log_path, lines=30)
+                with log_path.open("w", encoding="utf-8") as lf:
+                    proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, text=True)
             else:
-                _log(store, "  (re-run with --log to see error details)")
+                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    except Exception as exc:
-        elapsed = time.time() - t0
-        with lock:
-            results[store] = False
-            durations[store] = elapsed
-            starts.pop(store, None)
-        _log(store, f"ERROR: {exc}")
-        import traceback
-        traceback.print_exc()
+            elapsed = time.time() - t0
+            ok = proc.returncode == 0
+            with lock:
+                results[store] = ok
+                durations[store] = elapsed
+                starts.pop(store, None)
+            status = "done" if ok else f"FAILED (exit {proc.returncode})"
+            _log(store, f"{status}  [{elapsed / 60:.1f} min]")
+
+            if not ok:
+                if log_enabled:
+                    _tail(log_path, lines=30)
+                else:
+                    _log(store, "  (re-run with --log to see error details)")
+
+        except Exception as exc:
+            elapsed = time.time() - t0
+            with lock:
+                results[store] = False
+                durations[store] = elapsed
+                starts.pop(store, None)
+            _log(store, f"ERROR: {exc}")
+            import traceback
+            traceback.print_exc()
+    finally:
+        if group_lock is not None:
+            group_lock.release()
 
 
 def _log(store: str, msg: str) -> None:
@@ -273,15 +313,27 @@ def _run_phase(
     lock = threading.Lock()
     threads: List[threading.Thread] = []
 
+    # One lock per serial group present in this run; stores sharing a group run
+    # one at a time (see _SERIAL_GROUPS), everything else stays parallel.
+    group_locks: Dict[str, threading.Lock] = {}
+    serialized = {s: _SERIAL_GROUPS[s] for s in stores if s in _SERIAL_GROUPS}
+    if serialized:
+        for grp in sorted(set(serialized.values())):
+            members = [s for s in stores if serialized.get(s) == grp]
+            if len(members) > 1:
+                print(f"  serial group '{grp}': {', '.join(members)} will run one at a time")
+
     for store in stores:
         cmd = build_cmd(store, args)
         log_name = f"{store}{suffix}_{ts}.log"
         log_path = log_dir / log_name
         log_paths[store] = log_path
+        grp = _SERIAL_GROUPS.get(store)
+        glock = group_locks.setdefault(grp, threading.Lock()) if grp else None
         t = threading.Thread(
             target=_run_store,
             args=(store, cmd, log_path, results, durations, starts, lock),
-            kwargs={"log_enabled": log_enabled},
+            kwargs={"log_enabled": log_enabled, "group_lock": glock},
             name=f"{phase_name}:{store}",
             daemon=False,
         )
@@ -350,6 +402,11 @@ def main() -> None:
     parser.add_argument("--csv",         action="store_true",       help="Also export a CSV file after each scrape")
     parser.add_argument("--env",         type=str,  default=".env", help=".env file path (default: .env)")
     parser.add_argument("--log",         action="store_true",       help="Write per-store log files to logs/ (default: off)")
+    parser.add_argument("--only-stale",  action="store_true", dest="only_stale",
+                        help="Only run stores whose Neon data is older than --stale-hours "
+                             "(local self-heal for stores GitHub can't refresh, e.g. Convertiez)")
+    parser.add_argument("--stale-hours", type=int, default=24, dest="stale_hours",
+                        help="Staleness threshold in hours for --only-stale (default: 24)")
     args = parser.parse_args()
 
     stores = args.stores or list(_STORES)
@@ -357,6 +414,17 @@ def main() -> None:
 
     # Load env so DB_URL vars are available to subprocesses via inherited environment
     _load_env(args.env)
+
+    # ── stale filter ──────────────────────────────────────────────────────────
+    # Keep only stores whose Neon offers.updated_at is missing or older than the
+    # threshold. Lets a local `python -m main --only-stale` refresh exactly the
+    # stores that fell behind (blocked from GitHub, or a failed cloud run) while
+    # skipping the ones the cloud already keeps fresh. `--stores X` still forces X.
+    if args.only_stale:
+        stores = _filter_stale(stores, args.stale_hours)
+        if not stores:
+            print(f"All selected stores are fresh (< {args.stale_hours}h). Nothing to do.")
+            return
 
     # Create logs directory
     log_dir = Path("logs")
@@ -516,6 +584,53 @@ def _extract_progress_percent(log_path: Optional[Path]) -> Optional[float]:
             if 0.0 < val <= 100.0:
                 latest = val
     return latest
+
+
+def _filter_stale(stores: List[str], hours: int) -> List[str]:
+    """Return the subset of `stores` whose Neon offers.updated_at is missing or
+    older than `hours`. A store is considered stale (and kept) if its DB has no
+    rows, is unreachable, or has no registered env key — i.e. anything that means
+    "needs a local run". Fresh stores are skipped. Requires env already loaded."""
+    from datetime import datetime, timezone
+    from db.db_manager import STORE_REGISTRY
+
+    print(f"\nChecking Neon freshness (threshold {hours}h) for {len(stores)} store(s) ...")
+    now = datetime.now(timezone.utc)
+    stale: List[str] = []
+    for store in stores:
+        cls = STORE_REGISTRY.get(store)
+        if cls is None or not os.environ.get(cls.DB_ENV_KEY):
+            print(f"  {store:<22} no DB key — SKIP (can't run)")
+            continue
+        db = None
+        try:
+            db = cls()
+            last = db.last_update()
+        except Exception as exc:
+            print(f"  {store:<22} DB error ({exc.__class__.__name__}) — STALE (will run)")
+            stale.append(store)
+            continue
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        if last is None:
+            print(f"  {store:<22} empty — STALE (will run)")
+            stale.append(store)
+            continue
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        age_h = (now - last).total_seconds() / 3600
+        if age_h >= hours:
+            print(f"  {store:<22} {age_h:5.1f}h old — STALE (will run)")
+            stale.append(store)
+        else:
+            print(f"  {store:<22} {age_h:5.1f}h old — fresh, skip")
+    print(f"Stale stores to run: {len(stale)}"
+          + (f" ({', '.join(stale)})" if stale else ""))
+    return stale
 
 
 def _load_env(path: str = ".env") -> None:

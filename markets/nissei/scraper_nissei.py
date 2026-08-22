@@ -1,31 +1,31 @@
 """
-scraper_campea.py — Scraper for Drogarias Campeã (https://www.drogariascampea.com.br)
+scraper_nissei.py — Scraper for Farmácias Nissei (https://www.farmaciasnissei.com.br)
 
-Platform  : Convertiez (io.convertiez.com.br)
-Discovery : /s/drogariascampea/sitemap.xml -> sitemap-products-1.xml (~19.8k URLs)
-Per page  : each product page is server-rendered with an embedded Product JSON
-            block that carries everything we need:
-                name                 -> product_name
-                gtin13               -> ean / barcode (13-digit)
-                sku                  -> internal product id (product_id)
-                price                -> regular price
-                sale_price           -> promo price (when < price)
-                availability         -> is_available (schema.org/InStock)
-                image                -> image_url
-EAN       : first-class (gtin13) in the embedded JSON; no enrichment needed.
+Platform  : custom Django storefront (csrfmiddlewaretoken + csrftoken cookie).
+Discovery : /sitemap.xml -> produtos-1.xml ... produtos-4.xml (~30–40k product URLs).
+Per page  : server-rendered JSON-LD Product block carries everything except stock:
+                name    -> product_name
+                gtin    -> ean / barcode (13-digit; sometimes 14 w/ leading 0)
+                sku     -> internal product id (product_id)  [offers.sku]
+                price   -> regular price                     [offers.price]
+                brand   -> brand
+                image   -> image_url ("/media/..." -> absolute)
+            EAN is also printed in plain text ("EAN: 0789...") as a backup.
+Stock     : NOT in the page — the SPA calls POST /buscar/estoque with produto_id
+            + the Django CSRF token. Response `lista_estoque` = branches that have
+            the item. is_available = status is True AND lista_estoque is non-empty.
 
-Large catalogue (~19.8k products) fetched with a thread pool. Plain HTTP works
-(no bot wall). The embedded block is JSON-LD-shaped but contains raw control
-chars in the description, so fields are extracted with targeted regexes rather
-than a full json.loads.
+Large catalogue fetched with a thread pool; two requests per product (page GET +
+estoque POST). Plain HTTP; JSON-LD has raw control chars in `description`, so
+fields are pulled with targeted regexes rather than json.loads (same as Campea).
 
 Usage:
-    python -m markets.campea.scraper_campea              # scrape -> DB
-    python -m markets.campea.scraper_campea --limit 300  # test run -> DB
-    python -m markets.campea.scraper_campea --csv        # scrape -> DB + CSV
+    python -m markets.nissei.scraper_nissei                 # full scrape -> DB
+    python -m markets.nissei.scraper_nissei --limit 300     # test run -> DB
+    python -m markets.nissei.scraper_nissei --min-price 1000 # high-value refresh
+    python -m markets.nissei.scraper_nissei --no-stock      # skip estoque calls
 """
 
-import csv
 import re
 import sys
 import time
@@ -38,17 +38,13 @@ import requests
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_URL   = "https://www.drogariascampea.com.br"
-STORE_ID   = "campea"
-SITEMAP    = f"{BASE_URL}/s/drogariascampea/sitemap.xml"
-WORKERS    = 16
-DELAY      = 0.0
-MAX_TRIES  = 4
+BASE_URL  = "https://www.farmaciasnissei.com.br"
+STORE_ID  = "nissei"
+SITEMAP   = f"{BASE_URL}/sitemap.xml"
+ESTOQUE   = f"{BASE_URL}/buscar/estoque"
+WORKERS   = 12
+MAX_TRIES = 4
 
-# The Convertiez WAF 403s datacenter (GitHub Actions) IPs for a normal browser
-# UA, but lets the Googlebot UA through on page + sitemap routes — same bypass we
-# use for Drogasil's Cloudflare WAF. Residential IPs work with either UA.
-GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -57,21 +53,23 @@ BROWSER_UA = (
 
 _XML_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-# Field extractors over the embedded product JSON block
+# Field extractors. Anchor near "gtin" so we read the Product block, not the
+# Organization/Breadcrumb JSON-LD that also carry a "name".
+_RE_GTIN  = re.compile(r'"gtin"\s*:\s*"(\d{8,14})"')
+_RE_EAN_T = re.compile(r'EAN:\s*(\d{8,14})')            # plain-text backup
 _RE_NAME  = re.compile(r'"name"\s*:\s*"([^"]+)"')
 _RE_SKU   = re.compile(r'"sku"\s*:\s*"([^"]+)"')
-_RE_GTIN  = re.compile(r'"gtin13"\s*:\s*"(\d{8,14})"')
 _RE_PRICE = re.compile(r'"price"\s*:\s*"?([\d.]+)"?')
-_RE_SALE  = re.compile(r'"sale_price"\s*:\s*"?([\d.]+)"?')
-_RE_AVAIL = re.compile(r'"availability"\s*:\s*"([^"]+)"')
-_RE_IMG   = re.compile(r'"image"\s*:\s*\[\s*"([^"]+)"')
+_RE_LIST  = re.compile(r'"lowPrice"\s*:\s*"?([\d.]+)"?')
+_RE_IMG   = re.compile(r'"image"\s*:\s*"([^"]+)"')
 _RE_BRAND = re.compile(r'"brand"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"')
+_RE_CSRF  = re.compile(r"csrfmiddlewaretoken'\s*:\s*'([^']+)'")
 
 
 def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent":      GOOGLEBOT_UA,
+        "User-Agent":      BROWSER_UA,
         "Accept":          "text/html,application/xhtml+xml,*/*",
         "Accept-Language": "pt-BR,pt;q=0.9",
     })
@@ -105,13 +103,6 @@ def _get(session: requests.Session, url: str, diag: bool = False) -> Optional[re
 # Product URL discovery
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Known product sub-sitemaps — used as a fallback when the index can't be
-# fetched/parsed (e.g. a datacenter-IP bot challenge that returns HTML, not XML).
-SUBMAP_FALLBACK = [
-    f"{BASE_URL}/s/drogariascampea/sitemap-products-{i}.xml" for i in range(1, 6)
-]
-
-
 def _snippet(resp: requests.Response) -> str:
     ct = resp.headers.get("Content-Type", "?")
     body = (resp.text or "")[:160].replace("\n", " ").replace("\r", " ")
@@ -119,24 +110,22 @@ def _snippet(resp: requests.Response) -> str:
 
 
 def fetch_product_urls(session: requests.Session) -> List[str]:
-    sub_maps: List[str] = []
     root = _get(session, SITEMAP, diag=True)
     if root is None:
-        print("  sitemap index unreachable — falling back to known sub-sitemap URLs")
-    else:
-        try:
-            idx = ET.fromstring(root.content)
-            sub_maps = [
-                loc.text.strip()
-                for loc in idx.findall(".//sm:loc", _XML_NS)
-                if loc.text and "product" in loc.text.lower()
-            ]
-        except ET.ParseError:
-            # Not XML — almost always a bot-challenge/HTML page from datacenter IPs.
-            print(f"  sitemap index is not XML ({_snippet(root)}) — using fallback URLs")
-    if not sub_maps:
-        sub_maps = SUBMAP_FALLBACK
-    print(f"  product sub-sitemaps to read: {len(sub_maps)}")
+        print("ERROR: could not fetch sitemap index.")
+        return []
+    try:
+        idx = ET.fromstring(root.content)
+    except ET.ParseError:
+        print(f"  sitemap index is not XML ({_snippet(root)})")
+        return []
+
+    sub_maps = [
+        loc.text.strip()
+        for loc in idx.findall(".//sm:loc", _XML_NS)
+        if loc.text and "produto" in loc.text.lower()
+    ]
+    print(f"  product sub-sitemaps: {len(sub_maps)}")
 
     urls: List[str] = []
     seen: set = set()
@@ -152,10 +141,10 @@ def fetch_product_urls(session: requests.Session) -> List[str]:
         n0 = len(urls)
         for loc in xml.findall(".//sm:loc", _XML_NS):
             u = (loc.text or "").strip()
-            if u and u.endswith("/p") and u not in seen:
+            if u and u not in seen:
                 seen.add(u)
                 urls.append(u)
-        print(f"    {sm_url.rsplit('/', 1)[-1]}: +{len(urls) - n0} product URLs")
+        print(f"    {sm_url.rsplit('/', 1)[-1]}: +{len(urls) - n0} URLs")
     print(f"  Product URLs in sitemap: {len(urls):,}")
     return urls
 
@@ -178,64 +167,109 @@ def _first(rx: "re.Pattern", html: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _standardize(url: str, html: str) -> Optional[Dict]:
-    # Anchor to the embedded product block to avoid picking up unrelated fields
-    anchor = html.find('"gtin13"')
-    if anchor == -1:
-        anchor = html.find('"sale_price"')
-    if anchor == -1:
-        return None
-    window = html[max(0, anchor - 1500): anchor + 500]
+def _norm_ean(raw: str) -> str:
+    # Store carries EANs as 14 chars with a leading 0; normalise real EAN-13.
+    raw = (raw or "").strip()
+    if len(raw) == 14 and raw.startswith("0"):
+        return raw[1:]
+    return raw
 
-    name = _first(_RE_NAME, window) or _first(_RE_NAME, html)
-    sku  = _first(_RE_SKU, window) or _first(_RE_SKU, html)
-    gtin = _first(_RE_GTIN, window)
+
+def _fetch_csrf(session: requests.Session, urls: List[str]) -> str:
+    """Grab a Django CSRF token (stable per session) from a product page."""
+    for u in urls[:5]:
+        r = _get(session, u)
+        if r and _RE_CSRF.search(r.text):
+            return _RE_CSRF.search(r.text).group(1)
+    return ""
+
+
+def _check_stock(session: requests.Session, produto_id: str, csrf: str) -> Optional[bool]:
+    """POST /buscar/estoque; True/False if the answer is trustworthy, else None."""
+    if not produto_id or not csrf:
+        return None
+    for attempt in range(3):
+        try:
+            r = session.post(
+                ESTOQUE,
+                data={"csrfmiddlewaretoken": csrf, "produto_id": produto_id,
+                      "cliente_id": "", "parceiro_id": ""},
+                headers={"Referer": BASE_URL + "/", "X-Requested-With": "XMLHttpRequest",
+                         "X-CSRFToken": csrf},
+                timeout=25,
+            )
+        except requests.RequestException:
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code != 200:
+            time.sleep(2 * (attempt + 1))
+            continue
+        try:
+            data = r.json()
+        except ValueError:
+            return None
+        return bool(data.get("status")) and bool(data.get("lista_estoque"))
+    return None
+
+
+_RE_LDBLOCK = re.compile(r'<script[^>]*ld\+json[^>]*>(.*?)</script>', re.S | re.I)
+
+
+def _product_block(html: str) -> str:
+    """Return the JSON-LD <script> text that holds the Product (has "gtin").
+    Fields (name, gtin, brand, offers.price) live in one block but are far apart
+    because `description` is huge — so we scope to the whole block, not a window."""
+    for b in _RE_LDBLOCK.findall(html):
+        if '"gtin"' in b or '"Product"' in b:
+            return b
+    return ""
+
+
+def _standardize(url: str, html: str) -> Optional[Dict]:
+    block = _product_block(html)
+    if not block:
+        return None
+
+    gtin = _norm_ean(_first(_RE_GTIN, block) or _first(_RE_EAN_T, html))
+    name = _first(_RE_NAME, block)          # first "name" in the block = product name
     if not name:
         return None
 
-    # Convertiez feed: `sale_price` is the real SELLING price (it matches the
-    # schema.org JSON-LD offer price Google reads); `price` is a reference. When
-    # price > selling it is a genuine "de" (a real promo). When price < selling
-    # it is an understated value we must NOT trust — selling is then the regular
-    # price. This fixes products (~14-26% on veracruz/farmsaopaulo) whose price
-    # was stored at the lower, wrong `price`. (No effect on campea, whose price
-    # is always >= selling.)
-    price   = _to_float(_first(_RE_PRICE, window))
-    selling = _to_float(_first(_RE_SALE, window)) or price
-    if selling is None or selling <= 0:
+    regular = _to_float(_first(_RE_PRICE, block))
+    if regular is None or regular <= 0:
         return None
-    if price is not None and price > selling:
-        regular, promo_price = price, selling      # real discount (de/por)
-    else:
-        regular, promo_price = selling, None
+    list_price = _to_float(_first(_RE_LIST, block))
+    promo_price = None
+    if list_price and list_price > regular:
+        regular, promo_price = list_price, regular  # price is the sale price
+
     discount_pct = (
-        round((1 - promo_price / regular) * 100, 1)
-        if promo_price else None
+        round((1 - promo_price / regular) * 100, 1) if promo_price else None
     )
 
+    sku = _first(_RE_SKU, block)
     product_id = sku or url.rstrip("/").rsplit("/", 1)[-1]
-    # availability sits in the Offer block ~3k chars after gtin13 — outside the
-    # narrow window — and there is exactly one per product page, so read it from
-    # the full html (window-scoped read left every product unavailable).
-    available = "InStock" in _first(_RE_AVAIL, html)
+    image = _first(_RE_IMG, block)
+    if image.startswith("/"):
+        image = BASE_URL + image
 
     return {
         "product_id":    product_id,
         "store_id":      STORE_ID,
         "product_name":  name,
-        "brand":         _first(_RE_BRAND, window),
+        "brand":         _first(_RE_BRAND, block),
         "category_path": "",
         "ean":           gtin,
         "regular_price": regular,
         "promo_price":   promo_price,
         "discount_pct":  discount_pct,
         "unit":          "",
-        "is_available":  available,
+        "is_available":  True,      # set by the estoque call (see scrape)
         "stock":         None,
         "offer_tag":     "",
         "is_discounted": promo_price is not None,
         "product_url":   url,
-        "image_url":     _first(_RE_IMG, window),
+        "image_url":     image,
         "scraped_at":    datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
@@ -245,18 +279,15 @@ def _standardize(url: str, html: str) -> Optional[Dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def scrape(db, limit: Optional[int] = None, workers: int = WORKERS,
-           min_price: float = 0.0) -> Dict:
+           min_price: float = 0.0, check_stock: bool = True) -> Dict:
     session = _make_session()
 
     if min_price and min_price > 0:
-        # High-value refresh: only re-fetch pages for products the DB already
-        # knows are >= min_price. Campea is one HTTP request per product, so this
-        # trims a full ~19.8k-page run down to the handful of expensive items we
-        # actually track. New >= min_price products only appear via a full scrape
-        # (a price is unknown until its page is fetched), so run a full scrape
-        # periodically to seed them.
-        url_map = db.load_all_urls(min_price=min_price)
-        urls = list(url_map.values())
+        # High-value refresh: re-fetch only products the DB already knows are
+        # >= min_price (Nissei is per-page, so this trims a full ~35k-page run to
+        # the expensive items). New >= min_price products only appear via a full
+        # scrape (price is unknown until a page is fetched) — run one periodically.
+        urls = list(db.load_all_urls(min_price=min_price).values())
         print(f"High-value mode: {len(urls):,} products with regular_price >= {min_price:.0f} (from DB)")
         if not urls:
             print("No products at/above the threshold yet — run a full scrape first to seed prices.")
@@ -269,11 +300,15 @@ def scrape(db, limit: Optional[int] = None, workers: int = WORKERS,
     if limit:
         urls = urls[:limit]
 
+    csrf = _fetch_csrf(session, urls) if check_stock else ""
+    if check_stock and not csrf:
+        print("  WARN: no CSRF token — availability will default to True (stock check skipped).")
+
     total_upserted = total_history = total_skipped = total_saved = 0
     BATCH_SIZE = 300
     batch: List[Dict] = []
-    processed = 0
-    failed = 0
+    processed = failed = 0
+    no_stock = [0]  # list so worker threads can bump it (loose stat, races OK)
 
     def _flush() -> None:
         nonlocal total_saved, total_upserted, total_history, total_skipped
@@ -290,9 +325,19 @@ def scrape(db, limit: Optional[int] = None, workers: int = WORKERS,
         r = _get(session, url)
         if r is None:
             return None
-        return _standardize(url, r.text)
+        offer = _standardize(url, r.text)
+        if offer is None:
+            return None
+        if check_stock and csrf:
+            avail = _check_stock(session, offer["product_id"], csrf)
+            if avail is None:
+                no_stock[0] += 1   # couldn't confirm — keep listed-with-price as available
+            else:
+                offer["is_available"] = avail
+        return offer
 
-    print(f"Fetching {len(urls):,} product pages with {workers} workers ...")
+    print(f"Fetching {len(urls):,} product pages with {workers} workers "
+          f"(stock check: {'on' if check_stock and csrf else 'off'}) ...")
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_fetch_one, u): u for u in urls}
         for fut in as_completed(futures):
@@ -303,7 +348,8 @@ def scrape(db, limit: Optional[int] = None, workers: int = WORKERS,
             batch.append(offer)
             processed += 1
             if processed % 500 == 0:
-                print(f"  [{processed:>6}/{len(urls)}] parsed  (failed={failed}, saved={total_saved})")
+                print(f"  [{processed:>6}/{len(urls)}] parsed  (failed={failed}, "
+                      f"unconfirmed_stock={no_stock[0]}, saved={total_saved})")
             if len(batch) >= BATCH_SIZE:
                 _flush()
                 batch.clear()
@@ -311,29 +357,10 @@ def scrape(db, limit: Optional[int] = None, workers: int = WORKERS,
     _flush()
     batch.clear()
 
-    print(f"\nFinished: {processed:,} products parsed  ({failed} failed/skipped).")
+    print(f"\nFinished: {processed:,} products parsed  ({failed} failed/skipped, "
+          f"{no_stock[0]} with unconfirmed stock).")
     return {"upserted": total_upserted, "history_inserted": total_history,
             "skipped_zero": total_skipped, "total_unique": total_saved}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CSV export (optional)
-# ──────────────────────────────────────────────────────────────────────────────
-
-CSV_FIELDS = [
-    "product_id", "store_id", "product_name", "brand", "category_path",
-    "ean", "regular_price", "promo_price", "discount_pct",
-    "unit", "is_available", "stock", "offer_tag",
-    "product_url", "image_url", "scraped_at",
-]
-
-
-def save_csv(offers: List[Dict], path: str) -> None:
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(offers)
-    print(f"Saved {len(offers):,} rows -> {path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -344,23 +371,23 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Scrape Drogarias Campeã -> PostgreSQL (DB always written; CSV optional)"
+        description="Scrape Farmácias Nissei -> PostgreSQL"
     )
     parser.add_argument("--limit",   type=int, default=None,    help="Stop after N products (test)")
     parser.add_argument("--workers", type=int, default=WORKERS, help=f"Parallel workers (default: {WORKERS})")
-    parser.add_argument("--csv",     action="store_true",       help="Also export a CSV file after scrape")
-    parser.add_argument("--output",  type=str, default=None,    help="CSV path (implies --csv)")
     parser.add_argument("--min-price", type=float, default=0.0, dest="min_price",
-                        help="High-value refresh: only re-fetch DB products with "
-                             "regular_price >= this (0 = full sitemap scrape)")
+                        help="High-value refresh: only re-fetch DB products with regular_price >= this")
+    parser.add_argument("--no-stock", action="store_true",
+                        help="Skip the per-product /buscar/estoque availability call")
     parser.add_argument("--env",     type=str, default=".env",  help=".env file path")
     args = parser.parse_args()
 
-    from db.db_manager import CampeaDB, load_env
+    from db.db_manager import NisseiDB, load_env
     load_env(args.env)
 
-    db    = CampeaDB()
-    stats = scrape(db, limit=args.limit, workers=args.workers, min_price=args.min_price)
+    db    = NisseiDB()
+    stats = scrape(db, limit=args.limit, workers=args.workers,
+                   min_price=args.min_price, check_stock=not args.no_stock)
     db.close()
 
     print(f"\nDone.")
@@ -368,14 +395,6 @@ if __name__ == "__main__":
           f"history: {stats['history_inserted']:,}  "
           f"skipped (zero): {stats['skipped_zero']:,}")
 
-    # A scrape that discovered/saved nothing is a failure, not a silent success —
-    # exit non-zero so the orchestrator marks it FAILED and shows the log tail.
     if stats["total_unique"] == 0 and stats["upserted"] == 0:
         print("ERROR: scrape produced zero products — treating as failure.")
         sys.exit(1)
-
-    if args.csv or args.output:
-        output_dir = args.output or "."
-        db2 = CampeaDB()
-        db2.export(output_dir, tables=["offers"])
-        db2.close()

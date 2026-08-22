@@ -311,7 +311,12 @@ def _standardize_doc(doc: Dict) -> Optional[Dict]:
         "promo_price":   promo_price,
         "discount_pct":  discount_pct,
         "unit":          "",
-        "is_available":  bool(offer.get("isAvailable", True)),
+        # Marketplace offer: only "available" when the seller flags it AND real
+        # stock is present. Default the flag to False (not True) so a doc missing
+        # the field is never assumed in-stock. Note: this reflects marketplace-wide
+        # availability, not per-CEP deliverability (see _fetch_docs_by_departments).
+        "is_available":  bool(offer.get("isAvailable", False))
+                         and (stock_balance is None or (stock_balance or 0) > 0),
         "stock":         stock_balance,
         "offer_tag":     sku_id,
         "product_url":   product_url,
