@@ -264,6 +264,10 @@ if __name__ == "__main__":
           f"history: {stats['history_inserted']:,}  "
           f"skipped (zero): {stats['skipped_zero']:,}")
 
+    if stats["upserted"] == 0:
+        print("ERROR: 0 products scraped — treating as failure.")
+        sys.exit(1)
+
     if args.csv or args.output:
         output_dir = args.output or "."
         db2 = ProgoodsDB()

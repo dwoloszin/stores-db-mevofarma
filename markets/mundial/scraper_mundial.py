@@ -1,12 +1,23 @@
 """
 scraper_mundial.py — Scraper for Mundial Farma (https://mundialfarma.com.br)
 
-Platform  : WooCommerce / WordPress
-API       : /wp-json/wc/store/v1/products  (public WooCommerce Store API, no auth)
-Pagination: per_page (max 100) + page; X-WP-TotalPages header gives page count
-Prices    : Store API returns integer minor units (cents) — divide by
-            currency_minor_unit (2) to get BRL. regular_price / sale_price / price.
-EAN       : the product `sku` holds the barcode (13-digit EAN) for most products.
+Platform  : Magento 2 Open Source (theme "Mageshop"). MIGRATED off WooCommerce
+            ~2026-11 — the old `/wp-json/wc/store/v1/products` Store API 404s
+            now. Confirmed by homepage markup ("Magento", requirejs-config.js)
+            and the dead WooCommerce endpoint.
+API       : public Magento GraphQL, POST /graphql, no auth needed.
+            products(filter: {category_id: {eq: "2"}}, pageSize, currentPage)
+            — category id 2 is the storefront ROOT ("Menu Loja Virtual") and
+            returns the WHOLE catalogue (111 products) in one filter — no need
+            to walk the category tree (small, specialty/oncology catalogue).
+Pagination: pageSize<=100, page_info.total_pages gives the loop bound.
+EAN       : `sku` — most are 13-digit EANs; a few high-value biologics carry a
+            longer internal/ANVISA code instead (not a real EAN) — same EAN
+            regex validation as the rest of the fleet filters those out.
+Price     : price_range.minimum_price.{regular_price,final_price}.value (BRL,
+            already decimal, NOT minor units like the old WooCommerce API).
+URL       : product_url = {BASE_URL}/{url_key}  (clean URLs, no .html suffix —
+            confirmed against the live site, e.g. .../keytruda-100mg-4ml).
 
 Usage:
     python -m markets.mundial.scraper_mundial              # scrape -> DB
@@ -25,18 +36,44 @@ import requests
 
 sys.stdout.reconfigure(line_buffering=True)
 
-BASE_URL   = "https://mundialfarma.com.br"
-STORE_ID   = "mundial"
-API        = f"{BASE_URL}/wp-json/wc/store/v1/products"
-PER_PAGE   = 100    # WooCommerce Store API hard cap
-DELAY      = 0.25   # seconds between page requests
-MAX_TRIES  = 6
+BASE_URL    = "https://mundialfarma.com.br"
+STORE_ID    = "mundial"
+GRAPHQL_URL = f"{BASE_URL}/graphql"
+ROOT_CAT_ID = "2"    # storefront root ("Menu Loja Virtual") -> whole catalogue
+PAGE_SIZE   = 100    # Magento GraphQL default pageSize cap
+DELAY       = 0.25   # seconds between page requests
+MAX_TRIES   = 6
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+_QUERY = """
+query ($catId: String!, $pageSize: Int!, $currentPage: Int!) {
+  products(filter: {category_id: {eq: $catId}}, pageSize: $pageSize, currentPage: $currentPage) {
+    total_count
+    page_info { current_page total_pages }
+    items {
+      id
+      sku
+      name
+      url_key
+      stock_status
+      categories { name }
+      small_image { url }
+      price_range {
+        minimum_price {
+          regular_price { value }
+          final_price { value }
+          discount { percent_off }
+        }
+      }
+    }
+  }
+}
+"""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -48,16 +85,18 @@ def _make_session() -> requests.Session:
     s.headers.update({
         "User-Agent":      BROWSER_UA,
         "Accept":          "application/json",
+        "Content-Type":    "application/json",
         "Accept-Language": "pt-BR,pt;q=0.9",
     })
     return s
 
 
-def _fetch_page(session: requests.Session, page: int) -> Optional[requests.Response]:
-    """GET one products page with back-off on 429/5xx. Returns the Response or None."""
+def _fetch_page(session: requests.Session, page: int) -> Optional[Dict]:
+    """POST one GraphQL page with back-off on 429/5xx. Returns the `products` dict or None."""
+    body = {"query": _QUERY, "variables": {"catId": ROOT_CAT_ID, "pageSize": PAGE_SIZE, "currentPage": page}}
     for attempt in range(MAX_TRIES):
         try:
-            r = session.get(API, params={"per_page": PER_PAGE, "page": page}, timeout=30)
+            r = session.post(GRAPHQL_URL, json=body, timeout=30)
         except requests.RequestException:
             time.sleep(min(3 * (attempt + 1), 20))
             continue
@@ -66,7 +105,13 @@ def _fetch_page(session: requests.Session, page: int) -> Optional[requests.Respo
             continue
         if r.status_code != 200:
             return None
-        return r
+        try:
+            data = r.json()
+        except ValueError:
+            return None
+        if data.get("errors"):
+            return None
+        return (data.get("data") or {}).get("products")
     return None
 
 
@@ -74,19 +119,16 @@ def _fetch_page(session: requests.Session, page: int) -> Optional[requests.Respo
 # Standardize
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _price(raw: Any, minor_unit: int) -> Optional[float]:
-    if raw in (None, ""):
+_EAN_RE = re.compile(r"^\d{8,14}$")
+
+
+def _to_float(v: Any) -> Optional[float]:
+    if v is None or v == "":
         return None
     try:
-        return int(raw) / (10 ** minor_unit)
+        return float(v)
     except (ValueError, TypeError):
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return None
-
-
-_EAN_RE = re.compile(r"^\d{8,14}$")
+        return None
 
 
 def _standardize(p: Dict) -> Optional[Dict]:
@@ -95,30 +137,18 @@ def _standardize(p: Dict) -> Optional[Dict]:
     if not name or not pid:
         return None
 
-    prices = p.get("prices") or {}
-    minor  = int(prices.get("currency_minor_unit") or 2)
-
-    regular = _price(prices.get("regular_price"), minor)
-    sale    = _price(prices.get("sale_price"), minor)
-    price   = _price(prices.get("price"), minor)
-
-    # variable products expose a price_range instead of a single price
-    if regular is None:
-        pr = prices.get("price_range") or {}
-        regular = _price(pr.get("min_amount"), minor) or price
+    price_range = p.get("price_range") or {}
+    min_price   = price_range.get("minimum_price") or {}
+    regular = _to_float((min_price.get("regular_price") or {}).get("value"))
+    final   = _to_float((min_price.get("final_price") or {}).get("value"))
 
     if regular is None or regular <= 0:
-        if price and price > 0:
-            regular = price
+        if final and final > 0:
+            regular = final
         else:
             return None
 
-    on_sale = bool(p.get("on_sale"))
-    if on_sale and sale is not None and 0 < sale < regular:
-        promo_price = sale
-    else:
-        promo_price = None
-
+    promo_price = final if (final is not None and 0 < final < regular) else None
     discount_pct = (
         round((1 - promo_price / regular) * 100, 1)
         if promo_price and regular > 0 else None
@@ -130,8 +160,10 @@ def _standardize(p: Dict) -> Optional[Dict]:
     cats = p.get("categories") or []
     category_path = " > ".join(str(c.get("name") or "").strip() for c in cats if c.get("name"))
 
-    images = p.get("images") or []
-    image_url = str(images[0].get("src") or "").strip() if images else ""
+    image_url = str((p.get("small_image") or {}).get("url") or "").strip()
+
+    url_key = str(p.get("url_key") or "").strip()
+    product_url = f"{BASE_URL}/{url_key}" if url_key else BASE_URL
 
     return {
         "product_id":    pid,
@@ -144,11 +176,11 @@ def _standardize(p: Dict) -> Optional[Dict]:
         "promo_price":   promo_price,
         "discount_pct":  discount_pct,
         "unit":          "",
-        "is_available":  bool(p.get("is_in_stock", True)),
-        "stock":         p.get("low_stock_remaining"),
+        "is_available":  str(p.get("stock_status") or "").upper() == "IN_STOCK",
+        "stock":         None,
         "offer_tag":     sku if not ean else "",
         "is_discounted": promo_price is not None,
-        "product_url":   str(p.get("permalink") or "").strip(),
+        "product_url":   product_url,
         "image_url":     image_url,
         "scraped_at":    datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -166,28 +198,12 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
 
     first = _fetch_page(session, 1)
     if first is None:
-        print("ERROR: could not fetch products page 1 — aborting.")
+        print("ERROR: could not fetch products page 1 (GraphQL) — aborting.")
         return {"upserted": 0, "history_inserted": 0, "skipped_zero": 0, "total_unique": 0}
 
-    total_products = int(first.headers.get("X-WP-Total") or 0)
-    total_pages    = int(first.headers.get("X-WP-TotalPages") or 1)
-    print(f"WooCommerce Store API: {total_products:,} products across {total_pages} pages")
-
-    def _handle(resp: requests.Response) -> List[Dict]:
-        offers: List[Dict] = []
-        try:
-            products = resp.json()
-        except ValueError:
-            return offers
-        for p in products:
-            pid = str(p.get("id") or "").strip()
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            offer = _standardize(p)
-            if offer:
-                offers.append(offer)
-        return offers
+    total_products = int(first.get("total_count") or 0)
+    total_pages    = int((first.get("page_info") or {}).get("total_pages") or 1)
+    print(f"Magento GraphQL: {total_products:,} products across {total_pages} page(s)")
 
     def _flush(offers: List[Dict]) -> None:
         nonlocal total_saved, total_upserted, total_history, total_skipped
@@ -201,9 +217,18 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
         print(f"    -> saved {stats['upserted']} | price changes {stats['history_inserted']} | cumul {total_saved}")
 
     page = 1
-    resp = first
+    products = first
     while True:
-        offers = _handle(resp)
+        items = products.get("items") or []
+        offers: List[Dict] = []
+        for p in items:
+            pid = str(p.get("id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            offer = _standardize(p)
+            if offer:
+                offers.append(offer)
         _flush(offers)
         print(f"  page {page}/{total_pages}: {len(offers)} products  (cumul {total_saved})")
 
@@ -214,8 +239,8 @@ def scrape(db, limit: Optional[int] = None) -> Dict:
         if page > total_pages:
             break
         time.sleep(DELAY)
-        resp = _fetch_page(session, page)
-        if resp is None:
+        products = _fetch_page(session, page)
+        if products is None:
             print(f"  WARNING: page {page} failed after retries — catalogue may be incomplete")
             break
 
@@ -252,7 +277,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Scrape Mundial Farma -> PostgreSQL (DB is always written; CSV is optional)"
+        description="Scrape Mundial Farma (Magento GraphQL) -> PostgreSQL (DB always written; CSV optional)"
     )
     parser.add_argument("--limit",  type=int, default=None, help="Stop after N products (test)")
     parser.add_argument("--csv",    action="store_true",    help="Also save a local CSV file")
@@ -271,6 +296,10 @@ if __name__ == "__main__":
     print(f"  Upserted: {stats['upserted']:,}  "
           f"history: {stats['history_inserted']:,}  "
           f"skipped (zero): {stats['skipped_zero']:,}")
+
+    if stats["upserted"] == 0:
+        print("ERROR: 0 products scraped — treating as failure.")
+        sys.exit(1)
 
     if args.csv or args.output:
         output_dir = args.output or "."

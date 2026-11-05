@@ -29,9 +29,13 @@ import requests
 BR = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 SITES = {
-    "campea":       "https://www.drogariascampea.com.br/",
-    "veracruz":     "https://www.drogariaveracruz.com.br/",
-    "farmsaopaulo": "https://www.farmaciassaopaulo.com.br/",   # NB: double-s domain (slug is single-s)
+    # Probe io.convertiez's actual SITEMAP path, not just the storefront root --
+    # the storefront can be OK while the sitemap path (what the scraper actually
+    # needs) is 403'd on io.convertiez.com.br, and that mismatch gave a false
+    # "OK" here before (2026-11-02: storefronts all OK, sitemaps all 403).
+    "campea":       "https://io.convertiez.com.br/s/drogariascampea/sitemap.xml",
+    "veracruz":     "https://io.convertiez.com.br/s/drogariaveracruz/sitemap.xml",
+    "farmsaopaulo": "https://io.convertiez.com.br/s/farmaciasaopaulo/sitemap.xml",
 }
 
 

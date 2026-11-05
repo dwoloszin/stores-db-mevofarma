@@ -431,6 +431,10 @@ if __name__ == "__main__":
           f"history: {stats['history_inserted']:,}  "
           f"skipped: {stats['skipped_zero']:,}")
 
+    if stats["upserted"] == 0:
+        print("ERROR: 0 products scraped — treating as failure.")
+        sys.exit(1)
+
     if args.enrich_ean:
         print("\nFetching EAN from product pages...")
         from markets.ultrafarma.enrich_ean_ultrafarma import enrich
